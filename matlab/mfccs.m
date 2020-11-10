@@ -1,3 +1,5 @@
+% Function to calculate MFCCs and deltas
+
 function [dctcoeff,d] = mfccs(y,nbanks,twindow,fs)
 
 lwindow = twindow*fs;
