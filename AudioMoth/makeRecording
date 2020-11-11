@@ -1,0 +1,493 @@
+% This is a modification of the code at main.c in
+% https://github.com/OpenAcousticDevices/AudioMoth-Project/blob/master/src/main.c
+% THIS MUST BE INSIDE OF main.c 
+
+% It is a modification of makeRecording function and an addition of new ones.
+
+% The data in the buffer is processed (MFCC and neural network) to try to identify
+% Falco naumanni. Each ocurrence is written down in a filetext
+
+
+#include <time.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <complex.h>
+#include "ff.h"
+#include "ffconf.h"
+#include "math.h"
+#include "arm_math.h"
+#include "audioMoth.h"
+
+#define MAX_INT_VALUE						32767
+
+/* SRAM buffer constants */
+
+#define NUMBER_OF_BUFFERS                   128
+#define EXTERNAL_SRAM_SIZE_IN_SAMPLES       (AM_EXTERNAL_SRAM_SIZE_IN_BYTES / 2)
+#define NUMBER_OF_SAMPLES_IN_BUFFER         (EXTERNAL_SRAM_SIZE_IN_SAMPLES / NUMBER_OF_BUFFERS)
+#define NUMBER_OF_SAMPLES_IN_DMA_TRANSFER   1024
+#define NUMBER_OF_SUPERBUFFERS				8
+#define NUMBER_OF_BUFFERS_IN_SUPERBUFFER	(NUMBER_OF_BUFFERS / NUMBER_OF_SUPERBUFFERS)
+#define NUMBER_OF_SAMPLES_IN_SUPERBUFFER	NUMBER_OF_SAMPLES_IN_BUFFER * NUMBER_OF_BUFFERS_IN_SUPERBUFFER
+#define NUMBER_OF_BUFFERS_MFCC              5
+#define NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC	12
+#define NBANKS								41
+#define THRESHOLD_DETECTION					0.4f
+#define DETECTION_VALUE						THRESHOLD_DETECTION * NUMBER_OF_BUFFERS_IN_SUPERBUFFER
+\end{Ce}
+
+\vspace{2cm}
+
+\begin{Ce}{left}{701}{\textit{makeRecording()} function.}
+static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDuration, bool enableLED, AM_batteryState_t batteryState) {
+
+	/* Initialise microphone for recording */
+
+	AudioMoth_enableExternalSRAM();
+
+	AudioMoth_enableMicrophone(configSettings->gain, configSettings->clockDivider, configSettings->acquisitionCycles, configSettings->oversampleRate);
+
+	AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, NUMBER_OF_SAMPLES_IN_DMA_TRANSFER);
+
+	AudioMoth_startMicrophoneSamples(configSettings->sampleRate);
+
+    RETURN_ON_ERROR(AudioMoth_enableFileSystem());
+
+	/* Initialise buffers */
+
+    writeBuffer = 0;
+
+    writeBufferIndex = 0;
+
+
+    buffers[0] = (int16_t*)AM_EXTERNAL_SRAM_START_ADDRESS;
+
+    for (int i = 1; i < NUMBER_OF_BUFFERS; i += 1) {
+        buffers[i] = buffers[i - 1] + NUMBER_OF_SAMPLES_IN_BUFFER;
+    }
+
+    //static float32_t var[(sizeof(float32_t) * NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC)];
+    //buffersMFCC[0] = &var[0];
+    buffersMFCC[0] = (float32_t*)malloc(sizeof(float32_t) * NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC);
+    for (int i = 1; i < NUMBER_OF_BUFFERS_MFCC; i += 1) {
+		if (i==3){
+			buffersMFCC[i] = buffersMFCC[i - 1] + 2*NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC;
+		}
+		else {
+			buffersMFCC[i] = buffersMFCC[i - 1] + NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC;
+		}
+	}
+
+
+
+    /* Calculate the bits to shift */
+
+    bitsToShift = 0;
+
+    uint16_t oversampling = configSettings->oversampleRate * configSettings->sampleRateDivider;
+
+    while (oversampling > 16) {
+        oversampling >>= 1;
+        bitsToShift -= 1;
+    }
+
+    while (oversampling < 16) {
+        oversampling <<= 1;
+        bitsToShift += 1;
+    }
+
+    /* Calculate recording parameters */
+
+    uint32_t numberOfSamplesInHeader = sizeof(wavHeader) >> 1;
+
+    uint32_t numberOfSamples = configSettings->sampleRate / configSettings->sampleRateDivider * recordDuration;
+
+    /* Enable the battery monitor */
+
+    if (configSettings->enableBatteryCheck) {
+
+        AudioMoth_enableBatteryMonitor();
+
+        AudioMoth_setBatteryMonitorThreshold(AM_BATTERY_LOW);
+
+    }
+
+
+    /* Initialize file system and open a new file */
+   
+    if (enableLED) {
+
+        //AudioMoth_setRedLED(true);
+
+    }
+
+
+    /* Open a file with the current local time as the name */
+
+    time_t rawtime = currentTime + configSettings->timezoneHours * SECONDS_IN_HOUR + configSettings->timezoneMinutes * SECONDS_IN_MINUTE;
+
+    struct tm *time = gmtime(&rawtime);
+
+    sprintf(fileName, "%04d%02d%02d_%02d%02d%02d.WAV", 1900 + time->tm_year, time->tm_mon + 1, time->tm_mday, time->tm_hour, time->tm_min, time->tm_sec);
+
+    RETURN_ON_ERROR(AudioMoth_openFile(fileName));
+
+    RETURN_ON_ERROR(AudioMoth_closeFile(fileName));
+
+    AudioMoth_setRedLED(false);
+
+    /* Termination conditions */
+
+    switchPositionChanged = false;
+
+    bool batteryVoltageLow = false;
+
+    /* Main record loop */
+
+    uint32_t samplesWritten = 0;
+
+    uint32_t buffersProcessed = 0;
+
+    uint32_t readBuffer = writeBuffer;
+
+	float32_t keep_prob = 0;
+
+    while (samplesWritten < numberOfSamples + numberOfSamplesInHeader && !switchPositionChanged /*&& !batteryVoltageLow*/) {
+
+        while (readBuffer != writeBuffer && samplesWritten < numberOfSamples + numberOfSamplesInHeader && !switchPositionChanged /*&& !batteryVoltageLow*/) {
+
+            //Shift buffers to the left
+
+			for (int j = 0; j <NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC; j+= 1){
+				*(buffersMFCC[0]+j) = *(buffersMFCC[1]+j);
+				*(buffersMFCC[1]+j) = *(buffersMFCC[2]+j);
+				*(buffersMFCC[2]+j) = *(buffersMFCC[3]+j);
+				*(buffersMFCC[3]+j) = *(buffersMFCC[NUMBER_OF_BUFFERS_MFCC-1]+j);
+			}
+
+
+
+			//Calculate MFCCs corresponding buffer
+			MFCC(buffers[readBuffer], buffersMFCC[NUMBER_OF_BUFFERS_MFCC-1], readBuffer);
+
+
+
+			//Calculate deltas
+			deltas(buffersMFCC);
+
+			//Apply neural network
+			keep_prob += neuralNetwork(buffersMFCC[2]);
+
+
+			/* Write the appropriate number of bytes to the SD card */
+
+            uint32_t numberOfSamplesToWrite = 0;
+
+            //if (buffersProcessed >= NUMBER_OF_BUFFERS_TO_SKIP) {
+
+                numberOfSamplesToWrite = MIN(numberOfSamples + numberOfSamplesInHeader - samplesWritten, NUMBER_OF_BUFFERS_IN_SUPERBUFFER * NUMBER_OF_SAMPLES_IN_BUFFER);
+
+            //}
+
+			if ((readBuffer+1) % NUMBER_OF_BUFFERS_IN_SUPERBUFFER == 0){
+
+
+				AudioMoth_setRedLED(true);
+
+				RETURN_ON_ERROR(AudioMoth_appendFile(fileName));
+				RETURN_ON_ERROR(AudioMoth_writeToFile(buffers[readBuffer-NUMBER_OF_BUFFERS_IN_SUPERBUFFER+1], 2 * numberOfSamplesToWrite));
+				RETURN_ON_ERROR(AudioMoth_closeFile());
+
+				/* Increment buffer counters */
+
+				samplesWritten += numberOfSamplesToWrite;
+
+				buffersProcessed += 1;
+
+
+				if (keep_prob > (float32_t)(DETECTION_VALUE)){
+
+					//countdown = INIT_COUNTDOWN;
+					FIL callfile; //File to keep detections
+					f_open(&callfile,"calls.txt", FA_OPEN_APPEND | FA_WRITE);
+					uint32_t currentTime;
+					AudioMoth_getTime(&currentTime, NULL);
+					time_t rawtime = currentTime + configSettings->timezoneHours * 3600 + configSettings->timezoneMinutes * 60;
+					struct tm *time = gmtime(&rawtime);
+					char str[20];
+					sprintf(str, "%04d/%02d/%02d %02d:%02d:%02d \n", 1900 + time->tm_year, time->tm_mon + 1, time->tm_mday, time->tm_hour, time->tm_min, time->tm_sec);
+					f_puts(str,&callfile);
+					f_close(&callfile);
+
+					AudioMoth_setGreenLED(true);
+
+				} else {
+					//countdown = (countdown - 1);
+
+					AudioMoth_setGreenLED(false);
+				}
+				keep_prob = 0;
+
+            }
+
+			readBuffer = (readBuffer + 1) & (NUMBER_OF_BUFFERS - 1);
+
+            /* Clear LED */
+
+            AudioMoth_setRedLED(false);
+
+
+        }
+
+        /* Check the battery level */
+
+        if (configSettings->enableBatteryCheck && !AudioMoth_isBatteryMonitorAboveThreshold()) {
+
+            batteryVoltageLow = true;
+
+        }
+
+        /* Sleep until next DMA transfer is complete */
+
+        AudioMoth_sleep();
+
+    }
+
+    /* Disable battery check */
+
+	if (configSettings->enableBatteryCheck ) {
+
+		AudioMoth_disableBatteryMonitor();
+
+	}
+
+    /* Initialise the WAV header */
+
+    samplesWritten = MAX(numberOfSamplesInHeader, samplesWritten);
+
+    setHeaderDetails(configSettings->sampleRate / configSettings->sampleRateDivider, samplesWritten - numberOfSamplesInHeader);
+
+    setHeaderComment(currentTime, configSettings->timezoneHours, configSettings->timezoneMinutes, (uint8_t*)AM_UNIQUE_ID_START_ADDRESS, configSettings->gain, batteryState, batteryVoltageLow, switchPositionChanged);
+
+    /* Write the header */
+
+    if (enableLED) {
+
+        AudioMoth_setRedLED(true);
+
+    }
+
+
+    RETURN_ON_ERROR(AudioMoth_appendFile(fileName));
+    RETURN_ON_ERROR(AudioMoth_seekInFile(0));
+    RETURN_ON_ERROR(AudioMoth_writeToFile(&wavHeader, sizeof(wavHeader)));
+
+    /* Close the file */
+
+    RETURN_ON_ERROR(AudioMoth_closeFile());
+
+    AudioMoth_setRedLED(false);
+
+    /* Return with state */
+
+    if (batteryVoltageLow) return BATTERY_CHECK;
+
+    if (switchPositionChanged) return SWITCH_CHANGED;
+
+    return RECORDING_OKAY;
+
+}
+\end{Ce}
+
+\vspace{2cm}
+
+\begin{Ce}{left}{1098}{Functions needed in \textit{makeRecording()} that describe MFCCs extraction and neural network processing.}
+static void MFCC(int16_t *bufferIN, float32_t *bufferOUT, uint32_t readBuffer){
+
+	//Apply hamming window
+	static const float32_t hamming_window[NUMBER_OF_SAMPLES_IN_BUFFER] = {0.080000,0.080009,0.080035,0.080078,...
+		float32_t hamw[NUMBER_OF_SAMPLES_IN_BUFFER] = {0};
+	for (int i = 1; i < NUMBER_OF_SAMPLES_IN_BUFFER; i+= 1){
+		hamw[i] = hamming_window[i] * (((float32_t)*(bufferIN+i))/(float32_t)MAX_INT_VALUE);
+	}
+
+
+
+
+	//Apply FFT
+	float32_t cplxFFT[NUMBER_OF_SAMPLES_IN_BUFFER];
+	float32_t postFFT[NUMBER_OF_SAMPLES_IN_BUFFER/2];
+    arm_rfft_fast_init_f32 (&realFFTinstance,NUMBER_OF_SAMPLES_IN_BUFFER);
+    arm_rfft_fast_f32(&realFFTinstance, hamw, cplxFFT,0);
+    arm_cmplx_mag_f32(cplxFFT, postFFT, NUMBER_OF_SAMPLES_IN_BUFFER/2); //The input array has a total of 2*numSamples values; the output array has a total of numSamples values
+
+
+
+
+    //Apply Mel filters and log(sum())
+	static const int16_t infoH[NBANKS][2] = {{11,4},{13,4},{16,4},{18,5},{21,5},{24,5},{27,6}...
+	static const float32_t hbank[925] = {0.006387500000000,0.012775000000000,0.008516666666667,0.004258333333333...
+	static float32_t preDCT[NBANKS-1] = {0};
+    int16_t punt = 0;
+    for (int ibank = 0; ibank < NBANKS-1; ibank += 1){
+    	float32_t sum = 0;
+    	for (int i = 0; i < infoH[ibank][1]; i += 1){
+    		sum = sum + (*(postFFT+infoH[ibank][0]+i)) * hbank[i+punt];
+    	}
+    	punt = punt + infoH[ibank][1];
+    	preDCT[ibank] = (float32_t)log10((double)sum);
+    }
+
+
+    //Discrete cosine transform
+    DCTII(preDCT, bufferOUT);
+
+}
+
+static void DCTII(float32_t *indct, float32_t *outdct){
+	static const float32_t W = 0.223606797749979;
+	static const float32_t t = 0.039269908169872;
+
+	for (int k = 1; k < NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC + 1; k += 1){
+	
+		float32_t sum = 0;
+		for (int n = 0; n < NBANKS-1; n+= 1){
+		    //sum = sum + *(in+n)*cos((2*n+1)*k*t);
+		    sum = sum + *(indct+n)*arm_cos_f32((2*n+1)*k*t);
+		}
+
+		*(outdct+k-1) = W * sum;
+	}
+
+}
+
+static void deltas(float32_t **Dbuffers){
+	//Calcular deltas
+	uint8_t srcRows = NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC;
+	uint8_t srcColumns = 1;
+	arm_matrix_instance_f32 M0;
+	arm_matrix_instance_f32 M1;
+	arm_matrix_instance_f32 M2;
+	arm_matrix_instance_f32 M3;
+	arm_matrix_instance_f32 M4;
+	arm_matrix_instance_f32 M0K;
+	arm_matrix_instance_f32 M1K;
+	arm_matrix_instance_f32 M3K;
+	arm_matrix_instance_f32 M4K;
+	arm_matrix_instance_f32 MDELT;
+
+	arm_mat_init_f32(&M0, srcRows, srcColumns, *Dbuffers);
+	arm_mat_init_f32(&M1, srcRows, srcColumns, *(Dbuffers + 1));
+	arm_mat_init_f32(&M2, srcRows, srcColumns, *(Dbuffers + 2));
+	arm_mat_init_f32(&M3, srcRows, srcColumns, *(Dbuffers + 3));
+	arm_mat_init_f32(&M4, srcRows, srcColumns, *(Dbuffers + 4));
+	arm_mat_init_f32(&MDELT, srcRows, srcColumns, *(Dbuffers + 2) + NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC);
+
+
+	arm_mat_init_f32(&M4K, srcRows, srcColumns, MK4);
+	arm_mat_init_f32(&M3K, srcRows, srcColumns, MK3);
+	arm_mat_init_f32(&M1K, srcRows, srcColumns, MK1);
+	arm_mat_init_f32(&M0K, srcRows, srcColumns, MK0);
+
+	const float32_t scalep1 = 0.1;
+	const float32_t scalep2 = 0.2;
+	const float32_t scalen1 = -0.1;
+	const float32_t scalen2 = -0.2;
+
+	arm_mat_scale_f32 (&M0,scalen2, &M0K);
+	arm_mat_scale_f32 (&M1,scalen1, &M1K);
+	arm_mat_scale_f32 (&M3,scalep1, &M3K);
+	arm_mat_scale_f32 (&M4,scalep2, &M4K);
+
+	arm_mat_add_f32 (&M0K,&M4K,&M0K);
+	arm_mat_add_f32 (&M1K,&M3K,&M1K);
+	arm_mat_add_f32 (&M0K,&M1K,&MDELT);
+
+
+}
+
+static float32_t neuralNetwork(float32_t *bufferMFCC){
+
+	static const float32_t b1[2] = {-0.80761591265985332999,0.70817827130235644351};
+	static const float32_t b2[2] = {-2.9522122406295876473,3.1464177655874263628};
+	static const float32_t A1[48] = {-0.200636658389935,-0.491093372135600, ...
+	static const float32_t A2[4] = {3.1790411477338480495, 2.4568203259422229934,-2.8553231719653346943, -3.3896470973358105994};
+
+
+	float32_t L1[2];
+	float32_t L2[2];
+
+
+	arm_matrix_instance_f32 Minput;
+	arm_matrix_instance_f32 MA1;
+	arm_matrix_instance_f32 Mb1;
+	arm_matrix_instance_f32 MA2;
+	arm_matrix_instance_f32 Mb2;
+	arm_matrix_instance_f32 ML1;
+	arm_matrix_instance_f32 ML2;
+
+
+	uint8_t rows = 2;
+	uint8_t columns = 2*NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC;
+	uint8_t srcRows = NUMBER_OF_SAMPLES_IN_BUFFERS_MFCC;
+	uint8_t srcColumns = 1;
+
+	arm_status status;
+	arm_mat_init_f32(&Minput, 2*srcRows, srcColumns, bufferMFCC);
+	arm_mat_init_f32(&MA1, rows, columns, A1);
+	arm_mat_init_f32(&Mb1, rows, srcColumns, b1);
+	arm_mat_init_f32(&MA2, rows, 2*srcColumns, A2);
+	arm_mat_init_f32(&Mb2, rows, srcColumns, b2);
+	arm_mat_init_f32(&ML1, rows, srcColumns, L1);
+	arm_mat_init_f32(&ML2, rows, srcColumns, L2);
+
+
+	//Input and hidden layer
+	status = arm_mat_mult_f32 (&MA1,&Minput,&ML1);
+
+	if(ARM_MATH_SUCCESS == 1){
+		FLASH_LED(Both, LONG_LED_FLASH_DURATION);
+	}
+
+	arm_mat_add_f32 (&Mb1,&ML1,&ML1);
+
+
+	//Tansig
+	for (int i = 0; i < 2; i += 1 ){
+		L1[i] = 2 / (1 + exp(-2*L1[i])) - 1;
+	}
+
+	//Output layer
+	arm_mat_mult_f32 (&MA2,&ML1,&ML2);
+
+	arm_mat_add_f32 (&Mb2,&ML2,&ML2);
+
+	//Softmax
+	float32_t expo;
+	expo = exp(L2[0]);
+
+
+	return expo/(exp(L2[1])+expo);
+
+}
+
+\end{Ce}
+
+
+To debug the system, all needed information was saved as a text file in microSD card. The code is in the next box.
+
+\begin{Ce}{none}{0}{Function to write in SD card memory.}
+	FIL file;
+	f_open(&file,"dataINbuf.txt", FA_OPEN_APPEND | FA_WRITE);
+	for (int i = 0; i < NUMBER_OF_SAMPLES_IN_BUFFER; i+= 1){
+	  	char str[8];
+	   	sprintf(str, "\%d, ", (int)(*(buffers[readBuffer]+i) * MAX_INT_VALUE)); 	//To not lose information of decimals numbers 
+	    f_puts(str,&file);
+	}
+	char str[2];
+	sprintf(str, "\n");
+	f_puts(str,&file);
+	f_close(&file);
