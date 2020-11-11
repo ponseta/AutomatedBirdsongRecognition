@@ -37,11 +37,11 @@
 #define NBANKS								41
 #define THRESHOLD_DETECTION					0.4f
 #define DETECTION_VALUE						THRESHOLD_DETECTION * NUMBER_OF_BUFFERS_IN_SUPERBUFFER
-\end{Ce}
 
-\vspace{2cm}
 
-\begin{Ce}{left}{701}{\textit{makeRecording()} function.}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
 static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDuration, bool enableLED, AM_batteryState_t batteryState) {
 
 	/* Initialise microphone for recording */
@@ -169,7 +169,19 @@ static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDu
 			}
 
 
-
+// To debug the system, all needed information was saved as a text file in microSD card
+//			FIL fix;
+//			f_open(&fix,"dataINbuf.txt", FA_OPEN_APPEND | FA_WRITE);
+//		 	for (int i = 0; i < NUMBER_OF_SAMPLES_IN_BUFFER; i+= 1){
+//			    	char str[8];
+//			    	sprintf(str, "%d, ", (int)(*(buffers[readBuffer]+i)));
+//			        f_puts(str,&fix);
+//			}
+//			char str[2];
+//			sprintf(str, "\n");
+//			f_puts(str,&fix);
+//			f_close(&fix);
+	
 			//Calculate MFCCs corresponding buffer
 			MFCC(buffers[readBuffer], buffersMFCC[NUMBER_OF_BUFFERS_MFCC-1], readBuffer);
 
@@ -300,11 +312,14 @@ static AM_recordingState_t makeRecording(uint32_t currentTime, uint32_t recordDu
     return RECORDING_OKAY;
 
 }
-\end{Ce}
 
-\vspace{2cm}
 
-\begin{Ce}{left}{1098}{Functions needed in \textit{makeRecording()} that describe MFCCs extraction and neural network processing.}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/* FUNCTIONS NEEDED IN makeRecording THAT PERFORM MFCC EXTRACTION AND NEURAL NETWORK PROCESSING */
+
+
 static void MFCC(int16_t *bufferIN, float32_t *bufferOUT, uint32_t readBuffer){
 
 	//Apply hamming window
@@ -474,10 +489,10 @@ static float32_t neuralNetwork(float32_t *bufferMFCC){
 
 }
 
-\end{Ce}
 
 
-To debug the system, all needed information was saved as a text file in microSD card. The code is in the next box.
+
+
 
 \begin{Ce}{none}{0}{Function to write in SD card memory.}
 	FIL file;
